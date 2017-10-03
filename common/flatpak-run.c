@@ -4900,6 +4900,18 @@ calculate_ld_cache_checksum (GVariant *app_deploy_data,
   return g_strdup (g_checksum_get_string (ld_so_checksum));
 }
 
+static gboolean
+add_ld_so_conf(GPtrArray      *argv_array,
+               GArray         *fd_array,
+               GError        **error) {
+  const char *contents =
+    "include /run/flatpak/ld.so.conf.d/*.conf\n"
+    "include /app/etc/ld.so.conf\n"
+    "/app/lib\n";
+
+  return add_args_data (argv_array, fd_array,
+                        contents, -1, "/etc/ld.so.conf", error);
+}
 
 static int
 regenerate_ld_cache (GPtrArray      *base_argv_array,
@@ -4907,19 +4919,17 @@ regenerate_ld_cache (GPtrArray      *base_argv_array,
                      GFile          *app_id_dir,
                      const char     *checksum,
                      GFile          *runtime_files,
+                     gboolean        generate_ld_so_conf,
                      GCancellable   *cancellable,
                      GError        **error)
 {
   g_autoptr(GPtrArray) argv_array = NULL;
   g_autoptr(GArray) fd_array = NULL;
   g_autoptr(GArray) combined_fd_array = NULL;
-  g_autoptr(GFile) runtime_ld_so_conf = NULL;
   g_autoptr(GFile) ld_so_cache = NULL;
   g_autofree char *sandbox_cache_path = NULL;
   g_auto(GStrv) envp = NULL;
-  struct stat s;
   g_autofree char *commandline = NULL;
-  gboolean generate_ld_so_conf = TRUE;
   int exit_status;
   glnx_fd_close int ld_so_fd = -1;
   g_autoptr(GFile) ld_so_dir = NULL;
@@ -4953,25 +4963,14 @@ regenerate_ld_cache (GPtrArray      *base_argv_array,
 
   flatpak_run_setup_usr_links (argv_array, runtime_files);
 
-  runtime_ld_so_conf = g_file_resolve_relative_path (runtime_files, "etc/ld.so.conf");
-  if (lstat (flatpak_file_get_path_cached (runtime_ld_so_conf), &s) != 0)
-    generate_ld_so_conf = S_ISREG (s.st_mode) && s.st_size == 0;
-
-  if (generate_ld_so_conf)
-    {
-      const char *contents =
-        "include /run/flatpak/ld.so.conf.d/*.conf\n"
-        "include /app/etc/ld.so.conf\n"
-        "/app/lib\n";
-
-      if (!add_args_data (argv_array, fd_array,
-                          contents, -1, "/etc/ld.so.conf", error))
-        return FALSE;
-    }
-  else
+  if (generate_ld_so_conf) {
+    if (!add_ld_so_conf(argv_array, fd_array, error))
+      return -1;
+  } else {
     add_args (argv_array,
               "--symlink", "../usr/etc/ld.so.conf", "/etc/ld.so.conf",
               NULL);
+  }
 
   sandbox_cache_path = g_build_filename ("/run/ld-so-cache-dir", checksum, NULL);
 
@@ -5079,6 +5078,9 @@ flatpak_run_app (const char     *app_ref,
   g_autofree char *runtime_extensions = NULL;
   g_autofree char *checksum = NULL;
   int ld_so_fd = -1;
+  g_autoptr(GFile) runtime_ld_so_conf = NULL;
+  gboolean generate_ld_so_conf = TRUE;
+  struct stat s;
 
   app_ref_parts = flatpak_decompose_ref (app_ref, error);
   if (app_ref_parts == NULL)
@@ -5206,6 +5208,10 @@ flatpak_run_app (const char     *app_ref,
   if (!flatpak_run_add_extension_args (argv_array, fd_array, &envp, runtime_metakey, runtime_ref, TRUE, &runtime_extensions, cancellable, error))
     return FALSE;
 
+  runtime_ld_so_conf = g_file_resolve_relative_path (runtime_files, "etc/ld.so.conf");
+  if (lstat (flatpak_file_get_path_cached (runtime_ld_so_conf), &s) != 0)
+    generate_ld_so_conf = S_ISREG (s.st_mode) && s.st_size == 0;
+
   /* At this point we have the minimal argv set up, with just the app, runtime and extensions.
      We can reuse this to generate the ld.so.cache (if needed) */
   checksum = calculate_ld_cache_checksum (app_deploy_data, runtime_deploy_data,
@@ -5215,6 +5221,7 @@ flatpak_run_app (const char     *app_ref,
                                   app_id_dir,
                                   checksum,
                                   runtime_files,
+                                  generate_ld_so_conf,
                                   cancellable, error);
   if (ld_so_fd == -1)
     return FALSE;
@@ -5229,6 +5236,12 @@ flatpak_run_app (const char     *app_ref,
 
   if (!flatpak_run_setup_base_argv (argv_array, fd_array, runtime_files, app_id_dir, app_ref_parts[2], flags, error))
     return FALSE;
+
+  if (generate_ld_so_conf)
+    {
+      if (!add_ld_so_conf(argv_array, fd_array, error))
+        return FALSE;
+    }
 
   if (ld_so_fd != -1)
     {
